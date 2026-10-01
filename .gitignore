@@ -1,0 +1,15 @@
+# Ambienti virtuali
+venv/
+env/
+
+# Cache di Python
+__pycache__/
+*.pyc
+
+# Modelli e pesi (TTS, Wake Word)
+*.onnx
+*.json
+
+# File temporanei
+*.flag
+*.log
