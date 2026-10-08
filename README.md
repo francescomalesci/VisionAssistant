@@ -68,11 +68,10 @@ flowchart TD
 
 Developed and tested on an RTX 3080 (10-12GB VRAM), where `qwen2.5vl:3b`
 runs comfortably alongside the rest of the pipeline. On GPUs with less
-VRAM (e.g. an RTX 2060, 6GB), the full stack — Whisper, the chat LLM, and
+VRAM, the full stack — Whisper, the chat LLM, and
 a VLM — can exceed available memory when models overlap. If you hit
 out-of-memory issues:
-- switch `VLM_MODEL` to a lighter model such as `moondream` (~1.8B,
-  much smaller VRAM footprint)
+- switch `VLM_MODEL` to a lighter model
 - consider a smaller Whisper size (`WHISPER_MODEL_SIZE=base`) or a smaller
   chat LLM
 - Ollama unloads idle models automatically, so sequential (not simultaneous)
@@ -94,7 +93,7 @@ Install [Ollama](https://ollama.com), then pull the models:
 
 ```bash
 ollama pull qwen2.5:7b
-ollama pull qwen2.5vl:3b
+ollama pull qwen2.5vl:7b
 ```
 
 ### 3. faster-whisper CUDA DLLs (Windows only)
