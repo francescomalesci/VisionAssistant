@@ -11,7 +11,7 @@ import os
 # See README for where to download them.
 FASTER_WHISPER_DLL_DIR = os.getenv(
     "FASTER_WHISPER_DLL_DIR",
-    r"C:\Users\franc\Downloads\Faster-Whisper-XXL_r245.4_windows\Faster-Whisper-XXL\_xxl_data\torch\lib"
+    r"C:\path\to\Faster-Whisper-XXL\_xxl_data\torch\lib"
 )
 # --- Models ---
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
