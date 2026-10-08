@@ -1,3 +1,11 @@
+"""
+Local semantic search over known folders: indexes PDF/Markdown/text/Python
+files into ChromaDB (multilingual embeddings) and answers natural-language
+queries with the most relevant chunks, citing source file and page.
+
+Designed to be driven by voice: folder names are matched against spoken
+text with fuzzy matching to tolerate speech-to-text transcription errors.
+"""
 import os
 import gc
 import json
@@ -13,47 +21,49 @@ try:
     import psutil
     _process = psutil.Process(os.getpid())
 except ImportError:
-    _process = None  # senza psutil funziona lo stesso, ma senza monitoraggio della RAM
+    _process = None  # still works without it, just without RAM monitoring
 
-# pypdf emette un warning per ogni pagina con certi font: non sono errori.
+# pypdf logs a warning per page for certain fonts; these are not errors.
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 
-# ============================ CONFIGURAZIONE ============================
+logger = logging.getLogger(__name__)
 
-# Alias parlato -> percorso reale. RIMETTI QUI I TUOI ALIAS E PERCORSI.
+# ============================ CONFIGURATION ============================
+
+# Spoken alias -> real folder path. REPLACE WITH YOUR OWN FOLDERS.
 KNOWN_FOLDERS = {
-    "test": r"D:\Francy\Documenti\Prova"
+    "test": r"C:\path\to\a\test\folder"
 }
 
-# Parole che, insieme a un alias riconosciuto, attivano la ricerca nei file
+# Words that, together with a recognized folder alias, trigger a file search.
 SEARCH_TRIGGER_WORDS = {"cerca", "trova", "cercami", "trovami", "cartella", "file"}
 
 SUPPORTED_EXTENSIONS = (".py", ".md", ".txt", ".pdf")
 
-# Cartelle mai scandagliate. In più vengono saltate TUTTE le cartelle nascoste
-# (che iniziano con ".") e qualsiasi virtualenv, riconosciuto dal file pyvenv.cfg.
+# Folders that are never scanned. Hidden folders (starting with ".") and any
+# virtualenv (detected via pyvenv.cfg, regardless of its name) are also skipped.
 EXCLUDED_DIRS = {
     "venv", ".venv", "env", "site-packages", "dist-packages", "node_modules",
     "__pycache__", "chroma_db", "folder_cache_db", "build", "dist",
 }
 
-MAX_FILE_SIZE_MB = 50        # file più grandi vengono saltati
-MAX_CHUNKS_PER_FILE = 6000   # tetto di sicurezza per singolo file
+MAX_FILE_SIZE_MB = 50        # files larger than this are skipped
+MAX_CHUNKS_PER_FILE = 6000   # safety cap per single file
 
-# Il modello multilingue tronca il testo a 128 token (~500 caratteri): chunk più lunghi
-# verrebbero "visti" solo in parte dall'embedding. Con 500/100 il testo è coperto tutto.
+# The multilingual embedding model truncates input at 128 tokens (~500 chars):
+# longer chunks would only be "seen" partially. 500/100 keeps full coverage.
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
 
-UPSERT_BATCH_SIZE = 128      # chunk embeddati e salvati per volta (tiene bassa la RAM)
-N_RESULTS = 4                # chunk restituiti per ricerca
+UPSERT_BATCH_SIZE = 128      # chunks embedded and saved per batch (keeps RAM low)
+N_RESULTS = 4                # chunks returned per search
 
-# Guardia di sicurezza: se durante l'indicizzazione la RAM del processo cresce di più
-# di questo valore, si ferma (i file già fatti restano salvati) invece di bloccare il PC.
+# Safety guard: if RAM usage grows more than this during indexing, stop
+# (already-indexed files remain saved) instead of risking a system freeze.
 MAX_INDEX_RAM_GROWTH_GB = 6.0
 
-# Dalla voce si indicizzano al volo al massimo questi file nuovi/modificati;
-# oltre, si chiede di lanciare lo script index_folders.py a assistente spento.
+# Live (voice-triggered) indexing handles at most this many new/changed files;
+# beyond that, the user is told to run index_folders.py offline instead.
 AUTO_INDEX_MAX_FILES = 10
 
 MTIME_CHECK_COOLDOWN_SECONDS = 10
@@ -76,17 +86,18 @@ def _load_state() -> dict:
 
 
 def _save_state():
-    # Scrittura atomica: se il PC si blocca a metà, il file di stato non si corrompe
+    # Atomic write: if the process is interrupted mid-write, the state file
+    # is never left corrupted.
     tmp_path = STATE_FILE + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(_state, f)
     os.replace(tmp_path, STATE_FILE)
 
 
-# collection_name -> {percorso_file: firma}. Ricorda, file per file, cosa è già indicizzato.
+# collection_name -> {file_path: signature}. Tracks, file by file, what's indexed.
 _state = _load_state()
-_last_checked = {}   # folder_path -> timestamp dell'ultimo controllo (solo in memoria)
-_last_notice = {}    # folder_path -> ultimo avviso generato
+_last_checked = {}   # folder_path -> timestamp of the last check (in-memory only)
+_last_notice = {}    # folder_path -> last generated notice
 
 
 def _rss_gb() -> float | None:
@@ -94,17 +105,20 @@ def _rss_gb() -> float | None:
 
 
 def _collection_name_for(folder_path: str) -> str:
-    # Modello e dimensione dei chunk fanno parte della chiave: se cambiano, si crea
-    # un indice nuovo invece di mischiare embedding non confrontabili.
+    # Model name and chunk size are part of the key: different embeddings
+    # aren't comparable, so changing them creates a fresh index instead of
+    # mixing incompatible vectors.
     key = f"{folder_path}|{EMBEDDING_MODEL_NAME}|{CHUNK_SIZE}|{CHUNK_OVERLAP}"
     return "folder_" + hashlib.md5(key.encode()).hexdigest()[:12]
 
 
-# ---------------------------- Riconoscimento cartella ----------------------------
+# ---------------------------- Folder recognition ----------------------------
 
 def resolve_folder_alias(spoken_text: str, cutoff: float = 0.6) -> str | None:
-    """Cerca un alias noto ALL'INTERNO di una frase (esatto, poi fuzzy per tollerare
-    gli errori di trascrizione di Whisper). Ritorna l'ALIAS, non il percorso."""
+    """Finds a known alias INSIDE a spoken sentence (not a full-sentence match).
+    Tries an exact substring match first, then a fuzzy word-by-word match to
+    tolerate small Whisper transcription errors (e.g. "progetto codici"
+    instead of "progetto codice"). Returns the ALIAS, not the path."""
     spoken_text = spoken_text.lower().strip()
 
     for alias in KNOWN_FOLDERS:
@@ -122,7 +136,9 @@ def resolve_folder_alias(spoken_text: str, cutoff: float = 0.6) -> str | None:
 
 
 def should_search_files(spoken_text: str) -> tuple[bool, str | None]:
-    """(True, alias) se la frase contiene sia un alias riconosciuto sia una parola-trigger."""
+    """(True, alias) if the sentence contains both a recognized folder alias
+    AND a trigger word. Naming a folder without asking to search in it is
+    not enough to activate search mode."""
     spoken_lower = spoken_text.lower()
     alias = resolve_folder_alias(spoken_lower)
     if alias is None:
@@ -133,17 +149,17 @@ def should_search_files(spoken_text: str) -> tuple[bool, str | None]:
 
 
 def _clean_query(query: str, folder_alias: str) -> str:
-    """Toglie alias e parole di comando: resta solo cosa cercare."""
+    """Strips the folder alias and command words, leaving only what to search for."""
     cleaned = query.lower().replace(folder_alias, " ")
     words = [w for w in cleaned.split() if w.strip(",.?!") not in SEARCH_TRIGGER_WORDS]
     return " ".join(words).strip() or query
 
 
-# ---------------------------- Scansione file ----------------------------
+# ---------------------------- File scanning ----------------------------
 
 def _iter_candidate_files(folder_path: str, skipped: list | None = None):
     for root, dirs, files in os.walk(folder_path):
-        if "pyvenv.cfg" in files:      # è un virtualenv, con qualunque nome
+        if "pyvenv.cfg" in files:      # it's a virtualenv, whatever it's named
             dirs[:] = []
             continue
         dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
@@ -187,8 +203,8 @@ def _iter_chunks(text: str):
 
 
 def _iter_file_chunks(filepath: str):
-    """Genera (chunk, numero_pagina) uno alla volta: la RAM per file resta limitata.
-    Il numero pagina è None per i file non-PDF."""
+    """Yields (chunk, page_number) one at a time, so per-file memory stays
+    bounded. page_number is None for non-PDF files."""
     if filepath.lower().endswith(".pdf"):
         try:
             reader = PdfReader(filepath)
@@ -197,7 +213,7 @@ def _iter_file_chunks(filepath: str):
             return
         for page_number, page in enumerate(reader.pages, start=1):
             if page_number % 50 == 0:
-                print(f"[INDEX]   ...pagina {page_number}/{total_pages}")
+                logger.info(f"  ...page {page_number}/{total_pages}")
             try:
                 page_text = page.extract_text() or ""
             except Exception:
@@ -214,10 +230,10 @@ def _iter_file_chunks(filepath: str):
             yield chunk, None
 
 
-# ---------------------------- Indicizzazione ----------------------------
+# ---------------------------- Indexing ----------------------------
 
 def _index_file(collection, filepath: str) -> int:
-    """Indicizza un singolo file a piccoli blocchi. Ritorna il numero di chunk salvati."""
+    """Indexes a single file in small batches. Returns the number of chunks saved."""
     filename = os.path.basename(filepath)
     path_hash = hashlib.md5(filepath.encode()).hexdigest()[:16]
 
@@ -226,7 +242,7 @@ def _index_file(collection, filepath: str) -> int:
 
     for i, (chunk, page) in enumerate(_iter_file_chunks(filepath)):
         if i >= MAX_CHUNKS_PER_FILE:
-            print(f"[INDEX]   limite di {MAX_CHUNKS_PER_FILE} chunk raggiunto: il resto del file viene ignorato")
+            logger.warning(f"  reached the {MAX_CHUNKS_PER_FILE}-chunk cap: the rest of the file is skipped")
             break
 
         metadata = {"source": filename, "path": filepath}
@@ -247,8 +263,8 @@ def _index_file(collection, filepath: str) -> int:
 
 
 def _plan_sync(folder_path: str):
-    """Confronta i file su disco con quelli già indicizzati.
-    Ritorna (collection_name, current, removed, to_index)."""
+    """Compares files on disk with what's already indexed.
+    Returns (collection_name, current, removed, to_index)."""
     collection_name = _collection_name_for(folder_path)
     known = _state.get(collection_name, {})
 
@@ -260,22 +276,22 @@ def _plan_sync(folder_path: str):
 
     removed = [p for p in known if p not in current]
     to_index = [p for p, sig in current.items() if known.get(p) != sig]
-    to_index.sort(key=_file_size)   # prima i piccoli: risultati rapidi, i grossi per ultimi
+    to_index.sort(key=_file_size)   # small files first: quick wins before the big ones
     return collection_name, current, removed, to_index
 
 
 def sync_folder(folder_alias: str) -> bool:
     """
-    Allinea l'indice alla cartella: indicizza i file nuovi/modificati, toglie quelli
-    cancellati. Si salva file per file, quindi se viene interrotta riparte da dove era.
-    Ritorna True se ha completato, False se si è fermata per la guardia sulla RAM.
+    Syncs the index to the folder: indexes new/changed files, removes deleted
+    ones. Saves progress file by file, so an interrupted run resumes where it
+    left off. Returns True on completion, False if stopped by the RAM guard.
     """
     folder_path = KNOWN_FOLDERS[folder_alias]
     collection_name, current, removed, to_index = _plan_sync(folder_path)
 
     if collection_name not in _state:
-        # Prima volta per questa cartella/configurazione: si parte da una collection
-        # pulita, senza residui di eventuali run interrotte in passato.
+        # First time for this folder/config combo: start from a clean
+        # collection, with no leftovers from any previously interrupted run.
         try:
             _chroma_client.delete_collection(name=collection_name)
         except Exception:
@@ -294,46 +310,48 @@ def sync_folder(folder_alias: str) -> bool:
         _save_state()
 
     if not to_index:
-        print("[INDEX] Indice già aggiornato.")
+        logger.info("Index already up to date.")
         return True
 
     skipped = []
     list(_iter_candidate_files(folder_path, skipped))
     if skipped:
-        print(f"[INDEX] Saltati perché troppo grandi: {', '.join(skipped)}")
+        logger.info(f"Skipped (too large): {', '.join(skipped)}")
 
-    print(f"[INDEX] {len(to_index)} file da indicizzare in '{folder_alias}' ({len(removed)} rimossi).")
+    logger.info(f"{len(to_index)} files to index in '{folder_alias}' ({len(removed)} removed).")
     start_rss = _rss_gb()
 
     for n, path in enumerate(to_index, start=1):
         filename = os.path.basename(path)
-        print(f"[INDEX] ({n}/{len(to_index)}) {filename}")
+        logger.info(f"({n}/{len(to_index)}) {filename}")
 
-        collection.delete(where={"path": path})   # via eventuali vecchi chunk di questo file
+        collection.delete(where={"path": path})   # clear any old chunks for this file
         chunk_count = _index_file(collection, path)
         if chunk_count == 0:
-            print("[INDEX]   nessun testo estraibile (PDF scansionato?)")
+            logger.info("  no extractable text (scanned PDF?)")
 
-        # Segnato come fatto anche se vuoto, per non riprovarlo ad ogni avvio
+        # Marked as done even if empty, so it's not retried on every run
         known[path] = current[path]
         _save_state()
         gc.collect()
 
         rss = _rss_gb()
         if rss is not None:
-            print(f"[INDEX]   RAM del processo: {rss:.1f} GB")
+            logger.info(f"  process RAM: {rss:.1f} GB")
             if start_rss is not None and (rss - start_rss) > MAX_INDEX_RAM_GROWTH_GB:
-                print("[INDEX] ATTENZIONE: consumo di RAM troppo alto, mi fermo. "
-                      "I file già indicizzati restano salvati: rilancia per continuare.")
+                logger.warning(
+                    "RAM usage too high, stopping. Already-indexed files remain "
+                    "saved: rerun to continue."
+                )
                 return False
 
-    print("[INDEX] Indicizzazione completata.")
+    logger.info("Indexing completed.")
     return True
 
 
 def _auto_sync(folder_alias: str, folder_path: str) -> str | None:
-    """Usata durante una ricerca: aggiorna l'indice solo per piccole modifiche.
-    Ritorna un avviso testuale se qualcosa richiede attenzione, altrimenti None."""
+    """Used during a search: updates the index only for small changes.
+    Returns a notice string if something needs attention, else None."""
     now = time.time()
     last = _last_checked.get(folder_path)
     if last is not None and (now - last) < MTIME_CHECK_COOLDOWN_SECONDS:
@@ -354,10 +372,11 @@ def _auto_sync(folder_alias: str, folder_path: str) -> str | None:
     return notice
 
 
-# ---------------------------- Ricerca ----------------------------
+# ---------------------------- Search ----------------------------
 
 def search_in_folder(folder_alias: str, query: str) -> str:
-    """Cerca nei file di una cartella nota, tenendo l'indice aggiornato quando è poco lavoro."""
+    """Searches the files of a known folder, keeping the index up to date
+    when that's cheap enough to do inline."""
     folder_path = KNOWN_FOLDERS.get(folder_alias)
     if not folder_path or not os.path.isdir(folder_path):
         return f"Cartella non trovata. Cartelle disponibili: {', '.join(KNOWN_FOLDERS.keys())}."
@@ -371,13 +390,13 @@ def search_in_folder(folder_alias: str, query: str) -> str:
         return notice or "Questa cartella non contiene testo indicizzato."
 
     results = collection.query(query_texts=[_clean_query(query, folder_alias)], n_results=N_RESULTS)
-    if not results['documents'][0]:
+    if not results["documents"][0]:
         return "Nessun risultato trovato in quella cartella."
 
     output = []
-    for doc, meta in zip(results['documents'][0], results['metadatas'][0]):
-        location = meta['source']
-        if 'page' in meta:
+    for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+        location = meta["source"]
+        if "page" in meta:
             location += f" (pagina {meta['page']})"
         output.append(f"Nel file {location}: {doc.strip()}")
 

@@ -1,15 +1,20 @@
 """
-Indicizza le cartelle di KNOWN_FOLDERS FUORI dall'assistente vocale.
+Indexes the folders in KNOWN_FOLDERS OUTSIDE of the voice assistant.
 
-Uso (con l'assistente vocale CHIUSO, così RAM e VRAM sono tutte libere):
-    python index_folders.py                    -> tutte le cartelle
-    python index_folders.py università         -> solo quell'alias
-    python index_folders.py "progetto codice"  -> alias con spazi tra virgolette
+Usage (run with the voice assistant CLOSED, so RAM/VRAM are fully free):
+    python index_folders.py                    -> all folders
+    python index_folders.py university          -> a single alias
+    python index_folders.py "project code"       -> alias with spaces, quoted
 
-Si può interrompere con Ctrl+C e rilanciare: riparte dal punto in cui era.
+Can be interrupted with Ctrl+C and rerun: it resumes where it left off.
 """
 import sys
+import logging
+
 from rag_engine import KNOWN_FOLDERS, sync_folder
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
 
 def main():
@@ -17,13 +22,13 @@ def main():
 
     for alias in aliases:
         if alias not in KNOWN_FOLDERS:
-            print(f"Alias sconosciuto: '{alias}'. Disponibili: {', '.join(KNOWN_FOLDERS)}")
+            logger.error(f"Unknown alias: '{alias}'. Available: {', '.join(KNOWN_FOLDERS)}")
             continue
-        print(f"\n=== Indicizzazione: {alias} ===")
+        logger.info(f"\n=== Indexing: {alias} ===")
         try:
             sync_folder(alias)
         except KeyboardInterrupt:
-            print("\n[INDEX] Interrotto. I file già indicizzati restano salvati: rilancia per continuare.")
+            logger.info("Interrupted. Already-indexed files remain saved: rerun to continue.")
             break
 
 

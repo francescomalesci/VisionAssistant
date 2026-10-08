@@ -1,16 +1,28 @@
-from fastapi import FastAPI, WebSocket, Request
+"""
+Minimal local web UI: shows a live chat log of the voice assistant's
+conversation (user transcript, system status, assistant replies) over a
+WebSocket. The voice pipeline pushes messages to it via POST /send_message.
+
+This is a local debugging/demo UI, not intended to be exposed outside the
+local machine: /send_message has no authentication.
+"""
+import logging
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse
 
-app = FastAPI()
-connected_clients = set()
+logger = logging.getLogger(__name__)
 
-html_content = """
+app = FastAPI()
+connected_clients: set[WebSocket] = set()
+
+HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="it">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Assistente Vocale</title>
+    <title>Voice Assistant</title>
     <style>
         body { font-family: sans-serif; background-color: #121212; color: #ffffff; padding: 2rem; max-width: 800px; margin: 0 auto; }
         #status { padding: 10px; margin-bottom: 20px; border-radius: 5px; background-color: #1e1e1e; font-weight: bold; }
@@ -22,8 +34,8 @@ html_content = """
     </style>
 </head>
 <body>
-    <h2>Serena AI</h2>
-    <div id="status">Stato: Disconnesso</div>
+    <h2>Assistente AI</h2>
+    <div id="status">Status: disconnected</div>
     <div id="chat"></div>
 
     <script>
@@ -31,8 +43,8 @@ html_content = """
         const chat = document.getElementById("chat");
         const status = document.getElementById("status");
 
-        ws.onopen = () => status.innerText = "Stato: Connesso";
-        
+        ws.onopen = () => status.innerText = "Status: connected";
+
         ws.onmessage = (event) => {
             const data = JSON.parse(event.data);
             const div = document.createElement("div");
@@ -46,9 +58,11 @@ html_content = """
 </html>
 """
 
+
 @app.get("/")
-async def get():
-    return HTMLResponse(html_content)
+async def index():
+    return HTMLResponse(HTML_PAGE)
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -56,17 +70,19 @@ async def websocket_endpoint(websocket: WebSocket):
     connected_clients.add(websocket)
     try:
         while True:
-            await websocket.receive_text()
-    except:
-        connected_clients.remove(websocket)
+            await websocket.receive_text()  # kept alive; client doesn't send anything meaningful
+    except WebSocketDisconnect:
+        connected_clients.discard(websocket)
 
-# Endpoint che riceve i messaggi dal tuo script Python e li manda alla UI
+
 @app.post("/send_message")
 async def send_message(request: Request):
+    """Receives a message from the voice pipeline and broadcasts it to every
+    connected browser tab."""
     data = await request.json()
     for client in connected_clients.copy():
         try:
             await client.send_json(data)
-        except:
-            connected_clients.remove(client)
+        except Exception:
+            connected_clients.discard(client)
     return {"status": "ok"}

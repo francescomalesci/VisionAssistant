@@ -1,5 +1,7 @@
 @echo off
-cd /d "D:\Francy\Documenti\VoiceAssistant"
+cd /d "%~dp0"
+
+echo Verifica che Ollama sia in esecuzione prima di continuare...
 
 echo Avvio del server web...
 start cmd /k "venv\Scripts\activate && uvicorn server:app --host 0.0.0.0 --port 8000"

@@ -5,6 +5,7 @@ env/
 # Cache di Python
 __pycache__/
 *.pyc
+folder_cache_db/
 
 # Modelli e pesi (TTS, Wake Word)
 *.onnx
@@ -13,3 +14,6 @@ __pycache__/
 # File temporanei
 *.flag
 *.log
+
+*.sqlite3
+temp_frame.jpg
